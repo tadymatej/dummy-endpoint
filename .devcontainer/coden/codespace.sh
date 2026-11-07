@@ -34,9 +34,108 @@ install() {
     echo "coden: nainstalováno — $(coden-server --version 2>/dev/null || echo coden-server)"
 }
 
+# Hlídač nečinnosti: Codespace bez telefonu a bez práce Agenta po 4 minutách uspí.
+#
+# Codespace se účtuje za celou dobu běhu a GitHub ho sám uspí až po 4 hodinách bez práce
+# v editoru — do té doby by ubíral z kvóty i ve chvíli, kdy ho nikdo nepotřebuje. Server
+# se ptá přes svůj místní ovládací port (`control.json`); dokud je připojený telefon nebo
+# Agent pracuje či čeká na svolení, nečinnost se nepočítá vůbec. Uspává tokenem z tajemství
+# `CODEN_GITHUB_TOKEN_…` — ten, který GitHub do Codespace dává sám, to neumí. Bez tokenu
+# hlídač jen zapíše, proč nic nedělá. Probouzí aplikace, když se chce připojit.
+watchdog() {
+    local pidfile="$STATE/watchdog.pid"
+    if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+        return
+    fi
+    cat >"$STATE/watchdog.py" <<'EOF'
+import json, os, socket, sys, time, urllib.request
+
+STATE = sys.argv[1]
+IDLE_S = int(os.environ.get("CODEN_IDLE_S", "240"))
+SHARED = "/workspaces/.codespaces/shared/.env"
+
+def log(text):
+    print(time.strftime("%Y-%m-%dT%H:%M:%S"), "hlídač:", text, flush=True)
+
+def shared_env():
+    values = {}
+    try:
+        for line in open(SHARED):
+            key, _, value = line.rstrip("\n").partition("=")
+            values[key] = value.strip('"')
+    except OSError:
+        pass
+    return values
+
+def lookup(prefix, exact=False):
+    for source in (os.environ, shared_env()):
+        for key, value in source.items():
+            if (key == prefix if exact else key.startswith(prefix)) and value:
+                return value
+    return None
+
+def busy():
+    """Je připojený telefon, nebo Agent pracuje? Neodpovídající Server je nečinný."""
+    try:
+        access = json.load(open(os.path.join(STATE, "control.json")))
+        with socket.create_connection(("127.0.0.1", access["port"]), timeout=5) as c:
+            c.sendall((access["token"] + "\n" + json.dumps({"command": "status"}) + "\n").encode())
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = c.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        status = json.loads(data)
+    except Exception as e:
+        log(f"Server neodpovídá ({e})")
+        return False
+    return bool(status.get("sessions")) or status.get("agent_state") in ("Working", "WaitingForApproval")
+
+def stop(token, name):
+    request = urllib.request.Request(
+        f"https://api.github.com/user/codespaces/{name}/stop",
+        method="POST",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    urllib.request.urlopen(request, timeout=30).read()
+
+idle_since = time.monotonic()
+reported = False
+while True:
+    time.sleep(20)
+    if busy():
+        idle_since = time.monotonic()
+        continue
+    if time.monotonic() - idle_since < IDLE_S:
+        continue
+    token = lookup("CODEN_GITHUB_TOKEN_")
+    name = lookup("CODESPACE_NAME", exact=True)
+    if not token or not name:
+        if not reported:
+            log("chybí tajemství CODEN_GITHUB_TOKEN_… nebo jméno Codespace — uspat ho neumím")
+            reported = True
+        continue
+    log(f"{IDLE_S} s bez telefonu a bez práce Agenta — uspávám Codespace {name}")
+    try:
+        stop(token, name)
+        break
+    except Exception as e:
+        log(f"uspání selhalo: {e}")
+        idle_since = time.monotonic()
+EOF
+    setsid nohup python3 "$STATE/watchdog.py" "$STATE" </dev/null >>"$STATE/watchdog.log" 2>&1 &
+    echo $! >"$pidfile"
+}
+
 start() {
     mkdir -p "$STATE"
     chmod 700 "$STATE"
+    watchdog
     # Jen proces z vlastního pidfilu — ne podle jména, v Codespace může běžet i jiný.
     if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
         echo "coden: Server už běží"
