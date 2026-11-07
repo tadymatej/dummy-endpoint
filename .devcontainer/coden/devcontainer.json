@@ -1,0 +1,6 @@
+{
+  "name": "coden",
+  "image": "mcr.microsoft.com/devcontainers/universal:2",
+  "postCreateCommand": "curl -fsSL https://coden-app.com/codespace.sh | bash -s install",
+  "postStartCommand": "curl -fsSL https://coden-app.com/codespace.sh | bash -s start"
+}
