@@ -2,5 +2,12 @@
   "name": "coden",
   "image": "mcr.microsoft.com/devcontainers/universal:2",
   "postCreateCommand": "curl -fsSL https://coden-app.com/codespace.sh | bash -s install",
-  "postStartCommand": "bash .devcontainer/coden/codespace.sh start"
+  "postStartCommand": "bash .devcontainer/coden/codespace.sh start",
+  "forwardPorts": [7799],
+  "portsAttributes": {
+    "7799": {
+      "label": "coden",
+      "onAutoForward": "silent"
+    }
+  }
 }
