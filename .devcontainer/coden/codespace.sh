@@ -34,6 +34,8 @@ install() {
     echo "coden: nainstalováno — $(coden-server --version 2>/dev/null || echo coden-server)"
 }
 
+# Pomocník vedle Serveru: hlídač nečinnosti a párování dalšího telefonu.
+#
 # Hlídač nečinnosti: Codespace bez telefonu a bez práce Agenta po 4 minutách uspí.
 #
 # Codespace se účtuje za celou dobu běhu a GitHub ho sám uspí až po 4 hodinách bez práce
@@ -48,7 +50,7 @@ watchdog() {
         return
     fi
     cat >"$STATE/watchdog.py" <<'EOF'
-import json, os, socket, sys, time, urllib.request
+import http.server, json, os, socket, sys, threading, time, urllib.request
 
 STATE = sys.argv[1]
 IDLE_S = int(os.environ.get("CODEN_IDLE_S", "240"))
@@ -74,19 +76,23 @@ def lookup(prefix, exact=False):
                 return value
     return None
 
+def control(command):
+    """Jeden příkaz na místní ovládací port Serveru (`control.json`)."""
+    access = json.load(open(os.path.join(STATE, "control.json")))
+    with socket.create_connection(("127.0.0.1", access["port"]), timeout=5) as c:
+        c.sendall((access["token"] + "\n" + json.dumps(command) + "\n").encode())
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = c.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    return json.loads(data)
+
 def busy():
     """Je připojený telefon, nebo Agent pracuje? Neodpovídající Server je nečinný."""
     try:
-        access = json.load(open(os.path.join(STATE, "control.json")))
-        with socket.create_connection(("127.0.0.1", access["port"]), timeout=5) as c:
-            c.sendall((access["token"] + "\n" + json.dumps({"command": "status"}) + "\n").encode())
-            data = b""
-            while not data.endswith(b"\n"):
-                chunk = c.recv(65536)
-                if not chunk:
-                    break
-                data += chunk
-        status = json.loads(data)
+        status = control({"command": "status"})
     except Exception as e:
         log(f"Server neodpovídá ({e})")
         return False
@@ -103,6 +109,67 @@ def stop(token, name):
         },
     )
     urllib.request.urlopen(request, timeout=30).read()
+
+# ── Párování dalšího telefonu ─────────────────────────────────────────────────────
+#
+# Telefon s přihlášeným GitHubem si tu řekne o párovací kód (`POST /pair`). Port je
+# v Codespace **soukromý**: GitHub ho pustí jen s tokenem vlastníka Codespace
+# (`X-Github-Token`). Navíc se tu ověří, že token z hlavičky `X-Coden-Token` patří
+# témuž uživateli GitHubu, kterému Codespace patří — kdyby port někdo zveřejnil,
+# kód stejně nedostane cizí člověk.
+PAIR_PORT = int(os.environ.get("CODEN_PAIR_PORT", "7799"))
+
+def github_login(token):
+    request = urllib.request.Request(
+        "https://api.github.com/user",
+        headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"},
+    )
+    return json.load(urllib.request.urlopen(request, timeout=15)).get("login")
+
+class Pairing(http.server.BaseHTTPRequestHandler):
+    def answer(self, status, body):
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        self.answer(200, {"coden": True})
+
+    def do_POST(self):
+        if self.path != "/pair":
+            return self.answer(404, {"error": "neznámá cesta"})
+        token = self.headers.get("X-Coden-Token", "")
+        owner = lookup("GITHUB_USER", exact=True)
+        try:
+            login = github_login(token) if token else None
+        except Exception as e:
+            log(f"párování: token nejde ověřit ({e})")
+            login = None
+        if not login or not owner or login.lower() != owner.lower():
+            log(f"párování odmítnuto ({login or 'bez tokenu'})")
+            return self.answer(403, {"error": "token nepatří vlastníkovi Codespace"})
+        try:
+            response = control({"command": "pair", "validity_s": 600})
+        except Exception as e:
+            return self.answer(503, {"error": f"Server neodpovídá ({e})"})
+        if response.get("response") != "pairing":
+            return self.answer(500, {"error": response.get("description", "Server kód nevydal")})
+        log(f"párovací kód pro {login}")
+        self.answer(200, {"code": response["code"], "expiresInS": response.get("expires_in_s", 600)})
+
+    def log_message(self, *_):
+        pass
+
+def serve_pairing():
+    try:
+        http.server.ThreadingHTTPServer(("127.0.0.1", PAIR_PORT), Pairing).serve_forever()
+    except Exception as e:
+        log(f"párování: port {PAIR_PORT} nejde otevřít ({e})")
+
+threading.Thread(target=serve_pairing, daemon=True).start()
 
 idle_since = time.monotonic()
 reported = False
